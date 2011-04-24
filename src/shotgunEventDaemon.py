@@ -196,6 +196,8 @@ class Engine(daemonizer.Daemon):
         """
         self._continue = True
         self._eventIdData = {}
+        self._connError = False
+        self._connWarning = False
 
         # Read/parse the config
         self.config = Config(configPath)
@@ -347,6 +349,14 @@ class Engine(daemonizer.Daemon):
                     msg = "Unknown error: %s" % str(err)
                     conn_attempts = self._checkConnectionAttempts(conn_attempts, msg)
                 else:
+                    if self._connError:
+                        self.log.error('Reconnected to Shotgun')
+                        self._connError = False
+                        self._connWarning = False
+                    elif self._connWarning:
+                        self.log.warning('Reconnected to Shotgun')
+                        self._connWarning = False
+
                     lastEventId = result['id']
                     self.log.info('Last event id (%d) from the Shotgun database.', lastEventId)
 
@@ -419,12 +429,22 @@ class Engine(daemonizer.Daemon):
             conn_attempts = 0
             while True:
                 try:
-                    return self._sg.find("EventLogEntry", filters=filters, fields=fields, order=order, filter_operator='all')
+                    result = self._sg.find("EventLogEntry", filters=filters, fields=fields, order=order, filter_operator='all')
                 except (sg.ProtocolError, sg.ResponseError, socket.error), err:
                     conn_attempts = self._checkConnectionAttempts(conn_attempts, str(err))
                 except Exception, err:
                     msg = "Unknown error: %s" % str(err)
                     conn_attempts = self._checkConnectionAttempts(conn_attempts, msg)
+                else:
+                    if self._connError:
+                        self.log.error('Reconnected to Shotgun')
+                        self._connError = False
+                        self._connWarning = False
+                    elif self._connWarning:
+                        self.log.warning('Reconnected to Shotgun')
+                        self._connWarning = False
+                    
+                    return result
 
         return []
 
@@ -456,10 +476,12 @@ class Engine(daemonizer.Daemon):
     def _checkConnectionAttempts(self, conn_attempts, msg):
         conn_attempts += 1
         if conn_attempts == self._max_conn_retries:
+            self._connError = True
             self.log.error('Unable to connect to Shotgun (attempt %s of %s): %s', conn_attempts, self._max_conn_retries, msg)
             conn_attempts = 0
             time.sleep(self._conn_retry_sleep)
         else:
+            self._connWarning = True
             self.log.warning('Unable to connect to Shotgun (attempt %s of %s): %s', conn_attempts, self._max_conn_retries, msg)
         return conn_attempts
 
