@@ -39,19 +39,40 @@ import time
 import types
 import traceback
 
+from distutils.version import StrictVersion
+
 try:
     import cPickle as pickle
 except ImportError:
     import pickle
 
+if sys.platform == 'win32':
+    import win32serviceutil
+    import win32service
+    import win32event
+    import servicemanager
+
 import daemonizer
 import shotgun_api3 as sg
 
 
-EMAIL_FORMAT_STRING = """Time: %(asctime)s
+CURRENT_PYTHON_VERSION = StrictVersion(sys.version.split()[0])
+PYTHON_25 = StrictVersion('2.5')
+PYTHON_26 = StrictVersion('2.6')
+PYTHON_27 = StrictVersion('2.7')
+
+if CURRENT_PYTHON_VERSION > PYTHON_25:
+    EMAIL_FORMAT_STRING = """Time: %(asctime)s
 Logger: %(name)s
 Path: %(pathname)s
 Function: %(funcName)s
+Line: %(lineno)d
+
+%(message)s"""
+else:
+    EMAIL_FORMAT_STRING = """Time: %(asctime)s
+Logger: %(name)s
+Path: %(pathname)s
 Line: %(lineno)d
 
 %(message)s"""
@@ -84,7 +105,7 @@ def _removeHandlersFromLogger(logger, handlerTypes=None):
             logger.removeHandler(handler)
 
 
-def _addMailHandlerToLogger(logger, smtpServer, fromAddr, toAddrs, emailSubject, username=None, password=None):
+def _addMailHandlerToLogger(logger, smtpServer, fromAddr, toAddrs, emailSubject, username=None, password=None, secure=None):
     """
     Configure a logger with a handler that sends emails to specified
     addresses.
@@ -100,11 +121,7 @@ def _addMailHandlerToLogger(logger, smtpServer, fromAddr, toAddrs, emailSubject,
         SMTPHandler.
     """
     if smtpServer and fromAddr and toAddrs and emailSubject:
-        if username and password:
-            mailHandler = CustomSMTPHandler(smtpServer, fromAddr, toAddrs, emailSubject, (username, password))
-        else:
-            mailHandler = CustomSMTPHandler(smtpServer, fromAddr, toAddrs, emailSubject)
-
+        mailHandler = CustomSMTPHandler(smtpServer, fromAddr, toAddrs, emailSubject, (username, password), secure)
         mailHandler.setLevel(logging.ERROR)
         mailFormatter = logging.Formatter(EMAIL_FORMAT_STRING)
         mailHandler.setFormatter(mailFormatter)
@@ -143,6 +160,11 @@ class Config(ConfigParser.ConfigParser):
     def getSMTPServer(self):
         return self.get('emails', 'server')
 
+    def getSMTPPort(self):
+        if self.has_option('emails', 'port'):
+            return self.getint('emails', 'port')
+        return 25
+
     def getFromAddr(self):
         return self.get('emails', 'from')
 
@@ -162,11 +184,21 @@ class Config(ConfigParser.ConfigParser):
             return self.get('emails', 'password')
         return None
 
+    def getSecureSMTP(self):
+        if self.has_option('emails', 'useTLS'):
+            return self.getboolean('emails', 'useTLS') or False
+        return False
+
     def getLogMode(self):
         return self.getint('daemon', 'logMode')
 
     def getLogLevel(self):
         return self.getint('daemon', 'logging')
+
+    def getMaxEventBatchSize(self):
+        if self.has_option('daemon', 'max_event_batch_size'):
+            return self.getint('daemon', 'max_event_batch_size')
+        return 500
 
     def getLogFile(self, filename=None):
         if filename is None:
@@ -191,7 +223,7 @@ class Config(ConfigParser.ConfigParser):
         return path
 
 
-class Engine(daemonizer.Daemon):
+class Engine(object):
     """
     The engine holds the main loop of event processing.
     """
@@ -239,16 +271,7 @@ class Engine(daemonizer.Daemon):
 
         self.log.setLevel(self.config.getLogLevel())
 
-        super(Engine, self).__init__('shotgunEvent', self.config.getEnginePIDFile())
-
-    def start(self, daemonize=True):
-        if not daemonize:
-            # Setup the stdout logger
-            handler = logging.StreamHandler()
-            handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
-            logging.getLogger().addHandler(handler)
-
-        super(Engine, self).start(daemonize)
+        super(Engine, self).__init__()
 
     def setEmailsOnLogger(self, logger, emails):
         # Configure the logger for email output
@@ -258,10 +281,15 @@ class Engine(daemonizer.Daemon):
             return
 
         smtpServer = self.config.getSMTPServer()
+        smtpPort = self.config.getSMTPPort()
         fromAddr = self.config.getFromAddr()
         emailSubject = self.config.getEmailSubject()
         username = self.config.getEmailUsername()
         password = self.config.getEmailPassword()
+        if self.config.getSecureSMTP():
+            secure = (None, None)
+        else:
+            secure = None
 
         if emails is True:
             toAddrs = self.config.getToAddrs()
@@ -271,9 +299,11 @@ class Engine(daemonizer.Daemon):
             msg = 'Argument emails should be True to use the default addresses, False to not send any emails or a list of recipient addresses. Got %s.'
             raise ValueError(msg % type(emails))
 
-        _addMailHandlerToLogger(logger, smtpServer, fromAddr, toAddrs, emailSubject, username, password)
+        _addMailHandlerToLogger(
+            logger, (smtpServer, smtpPort), fromAddr, toAddrs, emailSubject, username, password, secure
+        )
 
-    def _run(self):
+    def start(self):
         """
         Start the processing of events.
 
@@ -296,7 +326,8 @@ class Engine(daemonizer.Daemon):
         except KeyboardInterrupt, err:
             self.log.warning('Keyboard interrupt. Cleaning up...')
         except Exception, err:
-            self.log.critical('Crash!!!!! Unexpected error (%s) in main loop.\n\n%s', type(err), traceback.format_exc(err))
+            msg = 'Crash!!!!! Unexpected error (%s) in main loop.\n\n%s'
+            self.log.critical(msg, type(err), traceback.format_exc(err))
 
     def _loadEventIdData(self):
         """
@@ -348,7 +379,7 @@ class Engine(daemonizer.Daemon):
                 order = [{'column':'id', 'direction':'desc'}]
                 try:
                     result = self._sg.find_one("EventLogEntry", filters=[], fields=['id'], order=order)
-                except (sg.ProtocolError, sg.ResponseError, socket.err), err:
+                except (sg.ProtocolError, sg.ResponseError, socket.error), err:
                     conn_attempts = self._checkConnectionAttempts(conn_attempts, str(err))
                 except Exception, err:
                     msg = "Unknown error: %s" % str(err)
@@ -411,7 +442,7 @@ class Engine(daemonizer.Daemon):
 
         self.log.debug('Shuting down event processing loop.')
 
-    def _cleanup(self):
+    def stop(self):
         self._continue = False
 
     def _getNewEvents(self):
@@ -434,7 +465,9 @@ class Engine(daemonizer.Daemon):
             conn_attempts = 0
             while True:
                 try:
-                    result = self._sg.find("EventLogEntry", filters=filters, fields=fields, order=order, filter_operator='all')
+                    result = self._sg.find("EventLogEntry", filters, fields, order, limit=self.config.getMaxEventBatchSize())
+                    if events:
+                        self.log.debug('Got %d events: %d to %d.', len(events), events[0]['id'], events[-1]['id'])
                 except (sg.ProtocolError, sg.ResponseError, socket.error), err:
                     conn_attempts = self._checkConnectionAttempts(conn_attempts, str(err))
                 except Exception, err:
@@ -630,7 +663,7 @@ class Plugin(object):
     def setState(self, state):
         if isinstance(state, int):
             self._lastEventId = state
-        elif isinstance(state, types.TupleType):
+        elif isinstance(state, tuple):
             self._lastEventId, self._backlog = state
         else:
             raise ValueError('Unknown state type: %s.' % type(state))
@@ -713,7 +746,7 @@ class Plugin(object):
             return
 
         regFunc = getattr(plugin, 'registerCallbacks', None)
-        if isinstance(regFunc, types.FunctionType):
+        if callable(regFunc):
             try:
                 regFunc(Registrar(self))
             except:
@@ -723,17 +756,18 @@ class Plugin(object):
             self._engine.log.critical('Did not find a registerCallbacks function in plugin at %s.', self._path)
             self._active = False
 
-    def registerCallback(self, sgScriptName, sgScriptKey, callback, matchEvents=None, args=None):
+    def registerCallback(self, sgScriptName, sgScriptKey, callback, matchEvents=None, args=None, stopOnError=True):
         """
         Register a callback in the plugin.
         """
         global sg
         sgConnection = sg.Shotgun(self._engine.config.getShotgunURL(), sgScriptName, sgScriptKey)
-        self._callbacks.append(Callback(callback, self, self._engine, sgConnection, matchEvents, args))
+        self._callbacks.append(Callback(callback, self, self._engine, sgConnection, matchEvents, args, stopOnError))
 
     def process(self, event):
         if event['id'] in self._backlog:
             if self._process(event):
+                self.logger.info('Processed id %d from backlog.' % event['id'])
                 del(self._backlog[event['id']])
                 self._updateLastEventId(event['id'])
         elif self._lastEventId is not None and event['id'] <= self._lastEventId:
@@ -766,7 +800,7 @@ class Plugin(object):
         if self._lastEventId is not None and eventId > self._lastEventId + 1:
             expiration = datetime.datetime.now() + datetime.timedelta(minutes=5)
             for skippedId in range(self._lastEventId + 1, eventId):
-                self.logger.debug('Adding event id %d to backlog.', skippedId)
+                self.logger.info('Adding event id %d to backlog.', skippedId)
                 self._backlog[skippedId] = expiration
         self._lastEventId = eventId
 
@@ -818,7 +852,7 @@ class Callback(object):
     A part of a plugin that can be called to process a Shotgun event.
     """
 
-    def __init__(self, callback, plugin, engine, shotgun, matchEvents=None, args=None):
+    def __init__(self, callback, plugin, engine, shotgun, matchEvents=None, args=None, stopOnError=True):
         """
         @param callback: The function to run when a Shotgun event occurs.
         @type callback: A function object.
@@ -829,7 +863,7 @@ class Callback(object):
         @type shotgun: L{sg.Shotgun}
         @param logger: An object to log messages with.
         @type logger: I{logging.Logger}
-        @param matchEvents: The event filter to match events against befor invoking callback.
+        @param matchEvents: The event filter to match events against before invoking callback.
         @type matchEvents: dict
         @param args: Any datastructure you would like to be passed to your
             callback function. Defaults to None.
@@ -847,6 +881,7 @@ class Callback(object):
         self._logger = None
         self._matchEvents = matchEvents
         self._args = args
+        self._stopOnError = stopOnError
         self._active = True
 
         # Find a name for this object
@@ -908,7 +943,8 @@ class Callback(object):
 
             msg = 'An error occured processing an event.\n\n%s\n\nLocal variables at outer most frame in plugin:\n\n%s'
             self._logger.critical(msg, traceback.format_exc(), pprint.pformat(stack[1].f_locals))
-            self._active = False
+            if self._stopOnError:
+                self._active = False
 
         return self._active
 
@@ -943,48 +979,193 @@ class CustomSMTPHandler(logging.handlers.SMTPHandler):
         logging.CRITICAL: 'CRITICAL - Shotgun event daemon.',
     }
 
+    def __init__(self, smtpServer, fromAddr, toAddrs, emailSubject, credentials=None, secure=None):
+        args = [smtpServer, fromAddr, toAddrs, emailSubject]
+        if credentials:
+            # Python 2.6 implemented the credentials argument
+            if CURRENT_PYTHON_VERSION >= PYTHON_26:
+                args.append(credentials)
+            else:
+                if isinstance(credentials, tuple):
+                    self.username, self.password = credentials
+                else:
+                    self.username = None
+
+            # Python 2.7 implemented the secure argument
+            if CURRENT_PYTHON_VERSION >= PYTHON_27:
+                args.append(secure)
+            else:
+                self.secure = secure
+
+        logging.handlers.SMTPHandler.__init__(self, *args)
+
     def getSubject(self, record):
         subject = logging.handlers.SMTPHandler.getSubject(self, record)
         if record.levelno in self.LEVEL_SUBJECTS:
             return subject + ' ' + self.LEVEL_SUBJECTS[record.levelno]
         return subject
 
+    def emit(self, record):
+        """
+        Emit a record.
+
+        Format the record and send it to the specified addressees.
+        """
+        # If the socket timeout isn't None, in Python 2.4 the socket read
+        # following enabling starttls() will hang. The default timeout will
+        # be reset to 60 later in 2 locations because Python 2.4 doesn't support
+        # except and finally in the same try block.
+        if CURRENT_PYTHON_VERSION >= PYTHON_25:
+            socket.setdefaulttimeout(None)
+
+        # Mostly copied from Python 2.7 implementation.
+        # Using email.Utils instead of email.utils for 2.4 compat.
+        try:
+            import smtplib
+            from email.Utils import formatdate
+            port = self.mailport
+            if not port:
+                port = smtplib.SMTP_PORT
+            smtp = smtplib.SMTP()
+            smtp.connect(self.mailhost, port)
+            msg = self.format(record)
+            msg = "From: %s\r\nTo: %s\r\nSubject: %s\r\nDate: %s\r\n\r\n%s" % (
+                            self.fromaddr,
+                            ",".join(self.toaddrs),
+                            self.getSubject(record),
+                            formatdate(), msg)
+            if self.username:
+                if self.secure is not None:
+                    smtp.ehlo()
+                    smtp.starttls(*self.secure)
+                    smtp.ehlo()
+                smtp.login(self.username, self.password)
+            smtp.sendmail(self.fromaddr, self.toaddrs, msg)
+            smtp.close()
+        except (KeyboardInterrupt, SystemExit):
+            socket.setdefaulttimeout(60)
+            raise
+        except:
+            self.handleError(record)
+
+        socket.setdefaulttimeout(60)
+
 
 class EventDaemonError(Exception):
+    """
+    Base error for the Shotgun event system.
+    """
     pass
 
 
 class ConfigError(EventDaemonError):
+    """
+    Used when an error is detected in the config file.
+    """
     pass
 
 
+if sys.platform == 'win32':
+    class WindowsService(win32serviceutil.ServiceFramework):
+        """
+        Windows service wrapper
+        """
+        _svc_name_ = "ShotgunEventDaemon"
+        _svc_display_name_ = "Shotgun Event Handler"
+
+        def __init__(self, args):
+            win32serviceutil.ServiceFramework.__init__(self, args)
+            self.hWaitStop = win32event.CreateEvent(None, 0, 0, None)
+            self._engine = Engine(_getConfigPath())
+
+        def SvcStop(self):
+            """
+            Stop the Windows service.
+            """
+            self.ReportServiceStatus(win32service.SERVICE_STOP_PENDING)
+            win32event.SetEvent(self.hWaitStop)
+            self._engine.stop()
+
+        def SvcDoRun(self):
+            """
+            Start the Windows service.
+            """
+            servicemanager.LogMsg(
+                servicemanager.EVENTLOG_INFORMATION_TYPE,
+                servicemanager.PYS_SERVICE_STARTED,
+                (self._svc_name_, '')
+            )
+            self.main()
+
+        def main(self):
+            """
+            Primary Windows entry point
+            """
+            self._engine.start()
+
+
+class LinuxDaemon(daemonizer.Daemon):
+    """
+    Linux Daemon wrapper or wrapper used for foreground operation on Windows
+    """
+    def __init__(self):
+        self._engine = Engine(_getConfigPath())
+        super(LinuxDaemon, self).__init__('shotgunEvent', self._engine.config.getEnginePIDFile())
+
+    def start(self, daemonize=True):
+        if not daemonize:
+            # Setup the stdout logger
+            handler = logging.StreamHandler()
+            handler.setFormatter(logging.Formatter("%(levelname)s:%(name)s:%(message)s"))
+            logging.getLogger().addHandler(handler)
+
+        super(LinuxDaemon, self).start(daemonize)
+
+    def _run(self):
+        """
+        Start the engine's main loop
+        """
+        self._engine.start()
+
+    def _cleanup(self):
+        self._engine.stop()
+
+
 def main():
-    if len(sys.argv) == 2:
-        daemon = Engine(_getConfigPath())
-
-        # Find the function to call on the daemon
+    """
+    """
+    action = None
+    if len(sys.argv) > 1:
         action = sys.argv[1]
+
+    if sys.platform == 'win32' and action != 'foreground':
+        win32serviceutil.HandleCommandLine(WindowsService)
+        return 0
+
+    if action:
+        daemon = LinuxDaemon()
+
+        # Find the function to call on the daemon and call it
         func = getattr(daemon, action, None)
+        if action[:1] != '_' and func is not None:
+            func()
+            return 0
 
-        # If no function was found, report error.
-        if action[:1] == '_' or func is None:
-            print "Unknown command: %s" % action
-            return 2
+        print "Unknown command: %s" % action
 
-        # Call the requested function
-        func()
-    else:
-        print "usage: %s start|stop|restart|foreground" % sys.argv[0]
-        return 2
-
-    return 0
+    print "usage: %s start|stop|restart|foreground" % sys.argv[0]
+    return 2
 
 
 def _getConfigPath():
     """
     Get the path of the shotgunEventDaemon configuration file.
     """
+<<<<<<< HEAD
     paths = ['/etc', os.path.join(os.path.dirname(__file__), "../conf/")]
+=======
+    paths = ['/etc', os.path.dirname(__file__)]
+>>>>>>> 2830f7a391a4fe546cee7812b2ac14d0404ceb84
 
     # Get the current path of the daemon script
     scriptPath = sys.argv[0]
@@ -1003,7 +1184,7 @@ def _getConfigPath():
             return path
 
     # No config file was found
-    raise EventDaemonError('Config path not found!')
+    raise EventDaemonError('Config path not found, searched %s' % ', '.join(paths))
 
 
 if __name__ == '__main__':
