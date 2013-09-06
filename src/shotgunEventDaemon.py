@@ -117,6 +117,11 @@ class Config(ConfigParser.ConfigParser):
         ConfigParser.ConfigParser.__init__(self)
         self.read(path)
 
+    def get(self, section, key):
+        result = ConfigParser.ConfigParser.get(self, section, key)
+        expandedResult = os.path.expandvars(result)
+        return expandedResult
+
     def getShotgunURL(self):
         return self.get('shotgun', 'server')
 
@@ -546,7 +551,27 @@ class PluginCollection(object):
         """
         newPlugins = {}
 
-        for basename in os.listdir(self.path):
+        retryTimes = [5, 15, 30]
+        pluginNames = None
+        listDirError = None
+
+        for retryTime in retryTimes:
+            try:
+                pluginNames = os.listdir(self.path)
+            except OSError, e:
+                self._engine.log.debug("Failed to list plugins folder: %s : Retrying after %d seconds" % (self.path, retryTime))
+                listDirError = e
+                time.sleep(retryTime)
+            else:
+                break
+
+        if pluginNames is None:
+            raise EventDaemonError("Error loading pluginNames after %d tries : %s" % (len(retryTimes), listDirError))
+
+        if listDirError:
+            self._engine.log.debug("List plugins folder succeeded")
+
+        for basename in pluginNames:
             if not basename.endswith('.py') or basename.startswith('.'):
                 continue
 
@@ -959,7 +984,7 @@ def _getConfigPath():
     """
     Get the path of the shotgunEventDaemon configuration file.
     """
-    paths = ['/etc']
+    paths = ['/etc', os.path.join(os.path.dirname(__file__), "../conf/")]
 
     # Get the current path of the daemon script
     scriptPath = sys.argv[0]
